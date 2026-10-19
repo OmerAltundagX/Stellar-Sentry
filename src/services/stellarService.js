@@ -1,4 +1,4 @@
-import { rpc, xdr, Address, Contract, nativeToScVal } from '@stellar/stellar-sdk';
+import { rpc, xdr, Address, nativeToScVal } from '@stellar/stellar-sdk';
 
 /**
  * Stellar Sentry — Core Service Layer
@@ -114,22 +114,105 @@ export function buildInstanceLedgerKey(contractId) {
 }
 
 /**
+ * Data key config as stored for a monitored contract.
+ * `kind` is missing on keys saved by older versions and defaults to 'symbol'.
+ * @typedef {Object} KeyConfig
+ * @property {string} name — symbol name, enum variant name, or base64 ScVal XDR (kind 'xdr')
+ * @property {'persistent'|'temporary'} type — storage durability
+ * @property {'symbol'|'enum'|'xdr'} [kind]
+ * @property {string} [arg] — optional enum variant argument (kind 'enum')
+ * @property {'address'|'symbol'|'string'|'u32'|'u64'|'i128'} [argType]
+ */
+
+/**
+ * Convert a user-entered enum argument into an ScVal.
+ * @param {string} value
+ * @param {KeyConfig['argType']} argType
+ * @returns {xdr.ScVal}
+ */
+function buildArgScVal(value, argType) {
+    switch (argType) {
+        case 'address':
+            return new Address(value).toScVal();
+        case 'u32': {
+            const n = Number(value);
+            if (!Number.isInteger(n) || n < 0 || n > 0xffffffff) {
+                throw new Error(`"${value}" is not a valid u32`);
+            }
+            return nativeToScVal(n, { type: 'u32' });
+        }
+        case 'u64':
+        case 'i128':
+            return nativeToScVal(BigInt(value), { type: argType });
+        case 'string':
+            return nativeToScVal(value, { type: 'string' });
+        case 'symbol':
+        default:
+            return nativeToScVal(value, { type: 'symbol' });
+    }
+}
+
+/**
+ * Build the ScVal a contract uses as the storage key.
+ *
+ * Soroban `#[contracttype]` enums are encoded as a Vec whose first element is
+ * the variant name as a Symbol, followed by the variant's fields — so
+ * `DataKey::Admin` is `Vec[Symbol("Admin")]` and `DataKey::Balance(addr)` is
+ * `Vec[Symbol("Balance"), Address]`.
+ *
+ * @param {KeyConfig} key
+ * @returns {xdr.ScVal}
+ */
+export function buildKeyScVal(key) {
+    const kind = key.kind || 'symbol';
+    if (kind === 'xdr') {
+        return xdr.ScVal.fromXDR(key.name.trim(), 'base64');
+    }
+    if (kind === 'enum') {
+        const parts = [nativeToScVal(key.name, { type: 'symbol' })];
+        if (key.arg && key.arg.trim() !== '') {
+            parts.push(buildArgScVal(key.arg.trim(), key.argType));
+        }
+        return xdr.ScVal.scvVec(parts);
+    }
+    return nativeToScVal(key.name, { type: 'symbol' });
+}
+
+/**
+ * Human-readable label for a data key, e.g. "counter" or "Balance(GABC…WXYZ)".
+ * @param {KeyConfig} key
+ * @returns {string}
+ */
+export function formatKeyLabel(key) {
+    const kind = key.kind || 'symbol';
+    if (kind === 'xdr') {
+        return `XDR ${key.name.trim().substring(0, 12)}…`;
+    }
+    if (kind === 'enum') {
+        const arg = key.arg?.trim();
+        if (!arg) return key.name;
+        const shortArg = arg.length > 12 ? `${arg.substring(0, 4)}…${arg.substring(arg.length - 4)}` : arg;
+        return `${key.name}(${shortArg})`;
+    }
+    return key.name;
+}
+
+/**
  * Build a LedgerKey for a specific contract data entry.
  * @param {string} contractId
- * @param {string} keySymbol — The symbol name of the key (e.g., "counter", "balance")
- * @param {'persistent'|'temporary'} storageType
+ * @param {KeyConfig} key
  * @returns {xdr.LedgerKey}
  */
-export function buildDataLedgerKey(contractId, keySymbol, storageType) {
+export function buildDataLedgerKey(contractId, key) {
     const contractAddress = new Address(contractId);
-    const durability = storageType === 'temporary'
+    const durability = key.type === 'temporary'
         ? xdr.ContractDataDurability.temporary()
         : xdr.ContractDataDurability.persistent();
 
     return xdr.LedgerKey.contractData(
         new xdr.LedgerKeyContractData({
             contract: contractAddress.toScAddress(),
-            key: nativeToScVal(keySymbol, { type: 'symbol' }),
+            key: buildKeyScVal(key),
             durability,
         })
     );
@@ -191,119 +274,133 @@ function formatDuration(totalSeconds) {
     return `${minutes}m`;
 }
 
-/**
- * Fetch TTL data for a contract's instance entry.
- * @param {string} contractId
- * @returns {Promise<Object>} The entry data with TTL metrics
- */
-export async function fetchContractInstanceTTL(contractId) {
-    const server = getServer();
-    const ledgerKey = buildInstanceLedgerKey(contractId);
+// --- Last-seen tracking ---
+// Remembers the last known liveUntilLedgerSeq of every entry we have seen,
+// so an entry that later disappears from the RPC can be reported as
+// expired/archived rather than "not found".
+const LAST_SEEN_STORAGE_KEY = 'stellar-sentry-last-seen';
+let lastSeen = null;
 
-    const { sequence: currentLedger } = await getLatestLedger();
-    const response = await server.getLedgerEntries(ledgerKey);
-
-    if (!response.entries || response.entries.length === 0) {
-        throw new Error(`Contract instance not found: ${contractId.substring(0, 10)}...`);
+function loadLastSeen() {
+    if (lastSeen) return lastSeen;
+    try {
+        const saved = JSON.parse(localStorage.getItem(LAST_SEEN_STORAGE_KEY));
+        lastSeen = saved && typeof saved === 'object' ? saved : {};
+    } catch {
+        lastSeen = {};
     }
+    return lastSeen;
+}
 
-    const entry = response.entries[0];
-    const liveUntilLedgerSeq = entry.liveUntilLedgerSeq;
-
-    if (liveUntilLedgerSeq === undefined || liveUntilLedgerSeq === null) {
-        throw new Error('Entry does not have TTL information (liveUntilLedgerSeq is missing)');
+function rememberLastSeen(ledgerKeyXdr, liveUntilLedgerSeq) {
+    const seen = loadLastSeen();
+    if (seen[ledgerKeyXdr] === liveUntilLedgerSeq) return;
+    seen[ledgerKeyXdr] = liveUntilLedgerSeq;
+    try {
+        localStorage.setItem(LAST_SEEN_STORAGE_KEY, JSON.stringify(seen));
+    } catch {
+        // Storage unavailable — tracking only lasts for this session
     }
-
-    const ttl = calculateTTL(liveUntilLedgerSeq, currentLedger, 'instance');
-
-    return {
-        contractId,
-        keyName: 'Contract Instance',
-        storageType: 'instance',
-        currentLedger,
-        liveUntilLedgerSeq,
-        lastModifiedLedger: entry.lastModifiedLedgerSeq,
-        ...ttl,
-    };
 }
 
 /**
- * Fetch TTL data for a specific contract data key.
- * @param {string} contractId
- * @param {string} keySymbol
- * @param {'persistent'|'temporary'} storageType
- * @returns {Promise<Object>}
+ * Explain why an entry was not returned by the RPC.
+ * @param {{storageType: string, keyName: string}} target
+ * @param {number|undefined} lastLiveUntil — last known liveUntilLedgerSeq, if ever seen
+ * @returns {{message: string, healthStatus: string}}
  */
-export async function fetchContractDataTTL(contractId, keySymbol, storageType = 'persistent') {
-    const server = getServer();
-    const ledgerKey = buildDataLedgerKey(contractId, keySymbol, storageType);
+function describeMissingEntry(target, lastLiveUntil) {
+    const what = target.storageType === 'instance'
+        ? 'Contract instance'
+        : `Data entry "${target.keyName}"`;
 
-    const { sequence: currentLedger } = await getLatestLedger();
-    const response = await server.getLedgerEntries(ledgerKey);
-
-    if (!response.entries || response.entries.length === 0) {
-        throw new Error(`Data entry "${keySymbol}" not found for contract ${contractId.substring(0, 10)}...`);
+    if (target.storageType === 'temporary') {
+        return lastLiveUntil
+            ? { healthStatus: 'archived', message: `${what} expired at ledger ${lastLiveUntil.toLocaleString()} and was deleted — temporary entries cannot be restored` }
+            : { healthStatus: 'error', message: `${what} not found — check the key, or it has already expired (temporary entries are deleted on expiry)` };
     }
 
-    const entry = response.entries[0];
-    const liveUntilLedgerSeq = entry.liveUntilLedgerSeq;
-
-    if (liveUntilLedgerSeq === undefined || liveUntilLedgerSeq === null) {
-        throw new Error(`Entry "${keySymbol}" does not have TTL information`);
-    }
-
-    const ttl = calculateTTL(liveUntilLedgerSeq, currentLedger, storageType);
-
-    return {
-        contractId,
-        keyName: keySymbol,
-        storageType,
-        currentLedger,
-        liveUntilLedgerSeq,
-        lastModifiedLedger: entry.lastModifiedLedgerSeq,
-        ...ttl,
-    };
+    return lastLiveUntil
+        ? { healthStatus: 'archived', message: `${what} expired at ledger ${lastLiveUntil.toLocaleString()} and was archived — restore it with a RestoreFootprint transaction` }
+        : { healthStatus: 'error', message: `${what} not found — it may not exist, or it has already expired and been archived` };
 }
 
 /**
  * Fetch all monitored entries for a contract configuration.
- * Returns instance data + any additional key entries.
- * @param {{contractId: string, keys: Array<{name: string, type: string}>}} config
+ * Returns instance data + any additional key entries, using a single
+ * getLedgerEntries call for the whole contract.
+ * @param {{contractId: string, keys: KeyConfig[]}} config
  * @returns {Promise<{contractId: string, entries: Array, error: string|null}>}
  */
 export async function fetchAllContractEntries(config) {
     const { contractId, keys = [] } = config;
-    const entries = [];
-    let error = null;
 
     try {
         // Make sure health percentages use the real network max TTL
         await getMaxEntryTTL();
 
-        // Always fetch the instance entry first
-        const instanceEntry = await fetchContractInstanceTTL(contractId);
-        entries.push(instanceEntry);
+        // One slot per displayed entry, in display order. Keys that can't be
+        // encoded keep their slot with an error instead of a ledger key.
+        const slots = [
+            { keyName: 'Contract Instance', storageType: 'instance', keyConfig: null, ledgerKey: buildInstanceLedgerKey(contractId) },
+            ...keys.map((key) => {
+                const slot = { keyName: formatKeyLabel(key), storageType: key.type, keyConfig: key };
+                try {
+                    slot.ledgerKey = buildDataLedgerKey(contractId, key);
+                } catch (err) {
+                    slot.error = `Invalid key: ${err.message}`;
+                }
+                return slot;
+            }),
+        ];
 
-        // Fetch additional data keys
-        for (const key of keys) {
-            try {
-                const dataEntry = await fetchContractDataTTL(contractId, key.name, key.type);
-                entries.push(dataEntry);
-            } catch (keyError) {
-                entries.push({
-                    contractId,
-                    keyName: key.name,
-                    storageType: key.type,
-                    error: keyError.message,
-                    healthStatus: 'error',
-                });
+        const ledgerKeys = slots.filter((s) => s.ledgerKey).map((s) => s.ledgerKey);
+        const response = await getServer().getLedgerEntries(...ledgerKeys);
+        const currentLedger = response.latestLedger;
+
+        const found = new Map(
+            (response.entries || []).map((entry) => [entry.key.toXDR('base64'), entry])
+        );
+
+        const entries = slots.map((slot) => {
+            const base = {
+                contractId,
+                keyName: slot.keyName,
+                storageType: slot.storageType,
+                keyConfig: slot.keyConfig,
+            };
+            if (slot.error) {
+                return { ...base, error: slot.error, healthStatus: 'error' };
             }
-        }
-    } catch (mainError) {
-        error = mainError.message;
-    }
 
-    return { contractId, entries, error };
+            const ledgerKeyXdr = slot.ledgerKey.toXDR('base64');
+            const entry = found.get(ledgerKeyXdr);
+
+            if (!entry || entry.liveUntilLedgerSeq === undefined || entry.liveUntilLedgerSeq === null) {
+                const { message, healthStatus } = describeMissingEntry(slot, loadLastSeen()[ledgerKeyXdr]);
+                return { ...base, error: message, healthStatus };
+            }
+
+            rememberLastSeen(ledgerKeyXdr, entry.liveUntilLedgerSeq);
+
+            return {
+                ...base,
+                currentLedger,
+                liveUntilLedgerSeq: entry.liveUntilLedgerSeq,
+                lastModifiedLedger: entry.lastModifiedLedgerSeq,
+                ...calculateTTL(entry.liveUntilLedgerSeq, currentLedger, slot.storageType),
+            };
+        });
+
+        // Without a live instance the contract is unusable — report it at card level
+        if (entries[0].error) {
+            return { contractId, entries: [], error: entries[0].error };
+        }
+
+        return { contractId, entries, error: null };
+    } catch (err) {
+        return { contractId, entries: [], error: err.message };
+    }
 }
 
 export { RPC_URL, NETWORK_PASSPHRASE, MAX_TTL, HEALTH_THRESHOLDS };

@@ -13,7 +13,7 @@ import {
     isConnected,
     isAllowed,
     requestAccess,
-    getPublicKey,
+    getAddress,
     signTransaction,
 } from '@stellar/freighter-api';
 
@@ -39,8 +39,8 @@ import {
  */
 export async function isFreighterInstalled() {
     try {
-        const connected = await isConnected();
-        return connected;
+        const { isConnected: connected } = await isConnected();
+        return !!connected;
     } catch {
         return false;
     }
@@ -60,14 +60,19 @@ export async function connectWallet() {
             };
         }
 
-        // Check if the app is already allowed
-        const allowed = await isAllowed();
-        if (!allowed) {
-            await requestAccess();
+        // Check if the app is already allowed; requestAccess prompts the user
+        // and returns the address once access is granted
+        const { isAllowed: allowed } = await isAllowed();
+        const access = allowed ? await getAddress() : await requestAccess();
+
+        if (access.error) {
+            throw new Error(access.error.message || 'Access to Freighter was denied');
+        }
+        if (!access.address) {
+            throw new Error('Freighter did not return an address — is the wallet unlocked?');
         }
 
-        const publicKey = await getPublicKey();
-        return { publicKey, error: null };
+        return { publicKey: access.address, error: null };
     } catch (err) {
         return {
             publicKey: null,
@@ -89,12 +94,12 @@ const TX_POLL_TIMEOUT_MS = 60_000;
  *
  * @param {rpc.Server} server
  * @param {string} contractId
- * @param {{name: string, type: 'persistent'|'temporary'}|null} dataKey — null for the instance
+ * @param {import('./stellarService.js').KeyConfig|null} dataKey — null for the instance
  * @returns {Promise<xdr.LedgerKey[]>}
  */
 async function buildFootprintKeys(server, contractId, dataKey) {
     if (dataKey) {
-        return [buildDataLedgerKey(contractId, dataKey.name, dataKey.type)];
+        return [buildDataLedgerKey(contractId, dataKey)];
     }
 
     const instanceKey = buildInstanceLedgerKey(contractId);
@@ -128,7 +133,7 @@ async function buildFootprintKeys(server, contractId, dataKey) {
  * @param {number} extendToLedgers — Ledgers past the current ledger to extend to
  *   (clamped to the network's maximum entry TTL)
  * @param {string} signerPublicKey — The user's public key (from Freighter)
- * @param {{name: string, type: 'persistent'|'temporary'}|null} [dataKey] — data entry to extend; omit for the instance
+ * @param {import('./stellarService.js').KeyConfig|null} [dataKey] — data entry to extend; omit for the instance
  * @returns {Promise<{success: boolean, txHash: string|null, error: string|null}>}
  */
 export async function extendContractTTL(contractId, extendToLedgers, signerPublicKey, dataKey = null) {
@@ -169,12 +174,16 @@ export async function extendContractTTL(contractId, extendToLedgers, signerPubli
         const preparedTx = rpc.assembleTransaction(tx, simulated).build();
 
         // Send to Freighter for signing
-        const signedXdr = await signTransaction(preparedTx.toXDR(), {
+        const signed = await signTransaction(preparedTx.toXDR(), {
             networkPassphrase: NETWORK_PASSPHRASE,
+            address: signerPublicKey,
         });
+        if (signed.error) {
+            throw new Error(signed.error.message || 'Transaction signing was rejected');
+        }
 
         // Submit the signed transaction
-        const signedTx = TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE);
+        const signedTx = TransactionBuilder.fromXDR(signed.signedTxXdr, NETWORK_PASSPHRASE);
         const sendResponse = await server.sendTransaction(signedTx);
 
         // PENDING and DUPLICATE mean the network has the transaction;

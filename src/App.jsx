@@ -93,8 +93,17 @@ export default function App() {
     }, []);
 
     // --- Fetch all contract data ---
+    // Each refresh gets an id; only the most recently started refresh may write
+    // its results, so a slow, stale response can't overwrite newer data or
+    // bring back a contract that was removed in the meantime.
+    const refreshIdRef = useRef(0);
+
     const refreshContractData = useCallback(async () => {
-        if (contracts.length === 0) return;
+        const refreshId = ++refreshIdRef.current;
+        if (contracts.length === 0) {
+            setIsLoading(false);
+            return;
+        }
 
         setIsLoading(true);
         try {
@@ -102,6 +111,7 @@ export default function App() {
             // Fetch all contracts in parallel
             const promises = contracts.map((config) => fetchAllContractEntries(config));
             const responses = await Promise.allSettled(promises);
+            if (refreshId !== refreshIdRef.current) return;
 
             responses.forEach((result, idx) => {
                 const config = contracts[idx];
@@ -118,9 +128,13 @@ export default function App() {
 
             setContractData(results);
         } catch (err) {
-            showToast(`Refresh failed: ${err.message}`, 'error');
+            if (refreshId === refreshIdRef.current) {
+                showToast(`Refresh failed: ${err.message}`, 'error');
+            }
         } finally {
-            setIsLoading(false);
+            if (refreshId === refreshIdRef.current) {
+                setIsLoading(false);
+            }
         }
     }, [contracts, showToast]);
 
@@ -208,9 +222,7 @@ export default function App() {
 
         // The instance extension also extends the contract's WASM code;
         // data entries are extended individually.
-        const dataKey = entry && entry.storageType !== 'instance'
-            ? { name: entry.keyName, type: entry.storageType }
-            : null;
+        const dataKey = entry?.keyConfig || null;
 
         showToast(`Extending ${entry?.keyName || 'TTL'} by ${days} days...`, 'success');
         const result = await extendContractTTL(

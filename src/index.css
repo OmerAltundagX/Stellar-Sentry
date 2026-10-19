@@ -763,6 +763,18 @@ body::before {
   flex-shrink: 0;
 }
 
+.key-row .form-select.key-kind-select {
+  width: 110px;
+}
+
+.key-block {
+  margin-bottom: var(--space-sm);
+}
+
+.key-arg-row {
+  padding-right: 28px; /* line up with the remove button above */
+}
+
 .key-remove-btn {
   background: none;
   border: none;

@@ -1,10 +1,19 @@
 import React, { useState } from 'react';
 import { Address } from '@stellar/stellar-sdk';
+import { buildDataLedgerKey, formatKeyLabel } from '../services/stellarService.js';
 
 /**
  * AddContractModal — Form for adding a new contract to monitor.
  * Supports adding multiple data keys with their storage types.
+ * Keys can be plain symbols, `#[contracttype]` enum variants (with an
+ * optional argument), or raw base64 ScVal XDR.
  */
+
+const KEY_NAME_PLACEHOLDERS = {
+    symbol: 'Key symbol name',
+    enum: 'Variant name, e.g. Balance',
+    xdr: 'Base64 ScVal XDR',
+};
 
 export default function AddContractModal({ isOpen, onClose, onAdd }) {
     const [contractId, setContractId] = useState('');
@@ -14,7 +23,7 @@ export default function AddContractModal({ isOpen, onClose, onAdd }) {
     if (!isOpen) return null;
 
     function handleAddKey() {
-        setKeys((prev) => [...prev, { name: '', type: 'persistent' }]);
+        setKeys((prev) => [...prev, { name: '', type: 'persistent', kind: 'symbol', arg: '', argType: 'address' }]);
     }
 
     function handleRemoveKey(idx) {
@@ -53,8 +62,22 @@ export default function AddContractModal({ isOpen, onClose, onAdd }) {
             return;
         }
 
-        // Filter out empty key names
-        const validKeys = keys.filter((k) => k.name.trim() !== '');
+        // Filter out empty key names; only enum keys keep their argument fields
+        const validKeys = keys
+            .filter((k) => k.name.trim() !== '')
+            .map((k) => (k.kind === 'enum'
+                ? { ...k, name: k.name.trim(), arg: k.arg.trim() }
+                : { name: k.name.trim(), type: k.type, kind: k.kind }));
+
+        // Make sure every key can be encoded before saving it
+        for (const key of validKeys) {
+            try {
+                buildDataLedgerKey(trimmedId, key);
+            } catch (err) {
+                setError(`Invalid key "${formatKeyLabel(key)}": ${err.message}`);
+                return;
+            }
+        }
 
         onAdd({
             contractId: trimmedId,
@@ -112,30 +135,66 @@ export default function AddContractModal({ isOpen, onClose, onAdd }) {
                         </div>
 
                         {keys.map((key, idx) => (
-                            <div className="key-row" key={idx}>
-                                <input
-                                    className="form-input"
-                                    type="text"
-                                    placeholder="Key symbol name"
-                                    value={key.name}
-                                    onChange={(e) => handleKeyChange(idx, 'name', e.target.value)}
-                                />
-                                <select
-                                    className="form-select"
-                                    value={key.type}
-                                    onChange={(e) => handleKeyChange(idx, 'type', e.target.value)}
-                                >
-                                    <option value="persistent">Persistent</option>
-                                    <option value="temporary">Temporary</option>
-                                </select>
-                                <button
-                                    type="button"
-                                    className="key-remove-btn"
-                                    onClick={() => handleRemoveKey(idx)}
-                                    title="Remove key"
-                                >
-                                    ✕
-                                </button>
+                            <div className="key-block" key={idx}>
+                                <div className="key-row">
+                                    <select
+                                        className="form-select key-kind-select"
+                                        value={key.kind}
+                                        onChange={(e) => handleKeyChange(idx, 'kind', e.target.value)}
+                                        title="Key encoding"
+                                    >
+                                        <option value="symbol">Symbol</option>
+                                        <option value="enum">Enum</option>
+                                        <option value="xdr">Raw XDR</option>
+                                    </select>
+                                    <input
+                                        className="form-input"
+                                        type="text"
+                                        placeholder={KEY_NAME_PLACEHOLDERS[key.kind]}
+                                        value={key.name}
+                                        onChange={(e) => handleKeyChange(idx, 'name', e.target.value)}
+                                    />
+                                    <select
+                                        className="form-select"
+                                        value={key.type}
+                                        onChange={(e) => handleKeyChange(idx, 'type', e.target.value)}
+                                    >
+                                        <option value="persistent">Persistent</option>
+                                        <option value="temporary">Temporary</option>
+                                    </select>
+                                    <button
+                                        type="button"
+                                        className="key-remove-btn"
+                                        onClick={() => handleRemoveKey(idx)}
+                                        title="Remove key"
+                                    >
+                                        ✕
+                                    </button>
+                                </div>
+                                {key.kind === 'enum' && (
+                                    <div className="key-row key-arg-row">
+                                        <select
+                                            className="form-select key-kind-select"
+                                            value={key.argType}
+                                            onChange={(e) => handleKeyChange(idx, 'argType', e.target.value)}
+                                            title="Argument type"
+                                        >
+                                            <option value="address">Address</option>
+                                            <option value="symbol">Symbol</option>
+                                            <option value="string">String</option>
+                                            <option value="u32">u32</option>
+                                            <option value="u64">u64</option>
+                                            <option value="i128">i128</option>
+                                        </select>
+                                        <input
+                                            className="form-input"
+                                            type="text"
+                                            placeholder="Argument (optional), e.g. G... address"
+                                            value={key.arg}
+                                            onChange={(e) => handleKeyChange(idx, 'arg', e.target.value)}
+                                        />
+                                    </div>
+                                )}
                             </div>
                         ))}
 
