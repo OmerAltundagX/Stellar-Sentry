@@ -53,10 +53,10 @@ export default function ContractCard({ contractId, entries, error, onRemove, onE
                                     {entry.storageType}
                                 </span>
                             </div>
-                            {onExtendTTL && (
+                            {onExtendTTL && !entry.error && (
                                 <button
                                     className="btn btn-extend btn-sm"
-                                    onClick={() => onExtendTTL(contractId)}
+                                    onClick={() => onExtendTTL(contractId, entry)}
                                     disabled={!walletConnected}
                                     title={walletConnected ? 'Extend TTL via Freighter' : 'Connect wallet first'}
                                 >

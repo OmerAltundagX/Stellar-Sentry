@@ -20,14 +20,18 @@ import {
 import {
     TransactionBuilder,
     SorobanDataBuilder,
-    Networks,
     Operation,
     rpc,
     xdr,
-    Address,
 } from '@stellar/stellar-sdk';
 
-import { RPC_URL, NETWORK_PASSPHRASE } from './stellarService.js';
+import {
+    RPC_URL,
+    NETWORK_PASSPHRASE,
+    getMaxEntryTTL,
+    buildInstanceLedgerKey,
+    buildDataLedgerKey,
+} from './stellarService.js';
 
 /**
  * Check if the Freighter extension is installed and available.
@@ -72,38 +76,76 @@ export async function connectWallet() {
     }
 }
 
+// How long to wait for a submitted transaction to be confirmed
+const TX_POLL_INTERVAL_MS = 2000;
+const TX_POLL_TIMEOUT_MS = 60_000;
+
 /**
- * Build and sign a transaction to extend the TTL of a contract instance.
+ * Build the ledger keys whose TTL should be extended.
+ *
+ * For the contract instance this includes the contract's WASM code entry as
+ * well — if the code expires the contract is unusable even when the instance
+ * is still live. Stellar Asset Contracts have no code entry.
+ *
+ * @param {rpc.Server} server
+ * @param {string} contractId
+ * @param {{name: string, type: 'persistent'|'temporary'}|null} dataKey — null for the instance
+ * @returns {Promise<xdr.LedgerKey[]>}
+ */
+async function buildFootprintKeys(server, contractId, dataKey) {
+    if (dataKey) {
+        return [buildDataLedgerKey(contractId, dataKey.name, dataKey.type)];
+    }
+
+    const instanceKey = buildInstanceLedgerKey(contractId);
+    const response = await server.getLedgerEntries(instanceKey);
+    if (!response.entries || response.entries.length === 0) {
+        throw new Error('Contract instance not found (it may be archived)');
+    }
+
+    const executable = response.entries[0].val.contractData().val().instance().executable();
+    if (executable.switch() !== xdr.ContractExecutableType.contractExecutableWasm()) {
+        return [instanceKey];
+    }
+
+    const codeKey = xdr.LedgerKey.contractCode(
+        new xdr.LedgerKeyContractCode({ hash: executable.wasmHash() })
+    );
+    return [instanceKey, codeKey];
+}
+
+/**
+ * Build and sign a transaction to extend the TTL of a contract instance
+ * (plus its WASM code) or of a single contract data entry.
  *
  * This function:
  * 1. Builds a transaction with Operation.extendFootprintTtl
  * 2. Simulates it via the Soroban RPC to calculate resource fees
  * 3. Sends it to Freighter for the user to sign
- * 4. Submits the signed transaction to the network
+ * 4. Submits the signed transaction to the network and waits for it
  *
  * @param {string} contractId — The contract whose TTL to extend
- * @param {number} extendToLedgers — Number of ledgers to extend to
+ * @param {number} extendToLedgers — Ledgers past the current ledger to extend to
+ *   (clamped to the network's maximum entry TTL)
  * @param {string} signerPublicKey — The user's public key (from Freighter)
+ * @param {{name: string, type: 'persistent'|'temporary'}|null} [dataKey] — data entry to extend; omit for the instance
  * @returns {Promise<{success: boolean, txHash: string|null, error: string|null}>}
  */
-export async function extendContractTTL(contractId, extendToLedgers, signerPublicKey) {
+export async function extendContractTTL(contractId, extendToLedgers, signerPublicKey, dataKey = null) {
     try {
         const server = new rpc.Server(RPC_URL, { allowHttp: false });
         const account = await server.getAccount(signerPublicKey);
 
-        // Build the contract instance ledger key for the footprint
-        const contractAddress = new Address(contractId);
-        const ledgerKey = xdr.LedgerKey.contractData(
-            new xdr.LedgerKeyContractData({
-                contract: contractAddress.toScAddress(),
-                key: xdr.ScVal.scvLedgerKeyContractInstance(),
-                durability: xdr.ContractDataDurability.persistent(),
-            })
-        );
+        // Entries can't live past maxEntryTtl - 1 ledgers; asking for more
+        // only inflates the simulated resource fee
+        const maxEntryTtl = await getMaxEntryTTL();
+        const extendTo = Math.min(Math.floor(extendToLedgers), maxEntryTtl - 1);
+
+        const footprintKeys = await buildFootprintKeys(server, contractId, dataKey);
 
         // Build the soroban data with footprint using SorobanDataBuilder
         const sorobanData = new SorobanDataBuilder()
-            .setFootprint([ledgerKey], [])
+            .setFootprint(footprintKeys, [])
             .build();
 
         // Build the transaction
@@ -111,11 +153,7 @@ export async function extendContractTTL(contractId, extendToLedgers, signerPubli
             fee: '100000', // 0.01 XLM base fee — simulation will adjust
             networkPassphrase: NETWORK_PASSPHRASE,
         })
-            .addOperation(
-                Operation.extendFootprintTtl({
-                    extendTo: extendToLedgers,
-                })
-            )
+            .addOperation(Operation.extendFootprintTtl({ extendTo }))
             .setSorobanData(sorobanData)
             .setTimeout(300)
             .build();
@@ -123,7 +161,7 @@ export async function extendContractTTL(contractId, extendToLedgers, signerPubli
         // Simulate to get the proper resource fees
         const simulated = await server.simulateTransaction(tx);
 
-        if (simulated.error) {
+        if (rpc.Api.isSimulationError(simulated)) {
             throw new Error(`Simulation failed: ${simulated.error}`);
         }
 
@@ -139,8 +177,13 @@ export async function extendContractTTL(contractId, extendToLedgers, signerPubli
         const signedTx = TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE);
         const sendResponse = await server.sendTransaction(signedTx);
 
+        // PENDING and DUPLICATE mean the network has the transaction;
+        // ERROR and TRY_AGAIN_LATER mean it was not accepted.
         if (sendResponse.status === 'ERROR') {
-            throw new Error(`Transaction submission failed: ${sendResponse.errorResult}`);
+            throw new Error(`Transaction submission failed: ${sendResponse.errorResult?.result().switch().name || 'unknown error'}`);
+        }
+        if (sendResponse.status === 'TRY_AGAIN_LATER') {
+            throw new Error('Network is busy — transaction was not accepted, please try again');
         }
 
         // Poll for completion
@@ -148,9 +191,13 @@ export async function extendContractTTL(contractId, extendToLedgers, signerPubli
         //   'NOT_FOUND' — still processing
         //   'SUCCESS'   — completed successfully
         //   'FAILED'    — transaction failed
+        const deadline = Date.now() + TX_POLL_TIMEOUT_MS;
         let result = await server.getTransaction(sendResponse.hash);
         while (result.status === 'NOT_FOUND') {
-            await new Promise((resolve) => setTimeout(resolve, 2000));
+            if (Date.now() > deadline) {
+                throw new Error(`Timed out waiting for transaction ${sendResponse.hash.substring(0, 12)}... — check it on a block explorer`);
+            }
+            await new Promise((resolve) => setTimeout(resolve, TX_POLL_INTERVAL_MS));
             result = await server.getTransaction(sendResponse.hash);
         }
 

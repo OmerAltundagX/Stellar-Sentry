@@ -5,6 +5,8 @@ import AddContractModal from './components/AddContractModal.jsx';
 import {
     checkNetworkStatus,
     fetchAllContractEntries,
+    getMaxEntryTTL,
+    MAX_TTL,
 } from './services/stellarService.js';
 import {
     isFreighterInstalled,
@@ -47,11 +49,16 @@ export default function App() {
     const [isModalOpen, setIsModalOpen] = useState(false);
 
     // --- Extend modal state ---
+    // entry: the TTL entry being extended ({ keyName, storageType, remainingLedgers, ... })
     const [extendModal, setExtendModal] = useState({
         open: false,
         contractId: null,
+        entry: null,
         days: 30,
     });
+
+    // Network maximum entry TTL in ledgers — caps how far an entry can be extended
+    const [maxEntryTtl, setMaxEntryTtl] = useState(MAX_TTL.persistent);
 
     // --- Wallet state ---
     const [walletState, setWalletState] = useState({
@@ -139,6 +146,13 @@ export default function App() {
         checkWallet();
     }, []);
 
+    // --- Fetch network max TTL on mount ---
+    useEffect(() => {
+        getMaxEntryTTL().then(setMaxEntryTtl);
+    }, []);
+
+    const maxExtendDays = Math.floor((maxEntryTtl - 1) / LEDGERS_PER_DAY);
+
     // --- Handlers ---
     function handleAddContract(config) {
         // Prevent duplicates
@@ -177,28 +191,33 @@ export default function App() {
         }
     }
 
-    function handleExtendTTL(contractId) {
+    function handleExtendTTL(contractId, entry) {
         if (!walletState.publicKey) {
             showToast('Please connect your wallet first', 'error');
             return;
         }
-        setExtendModal({ open: true, contractId, days: 30 });
+        setExtendModal({ open: true, contractId, entry, days: Math.min(30, maxExtendDays) });
     }
 
     async function handleExtendSubmit() {
-        const { contractId, days } = extendModal;
+        const { contractId, entry, days } = extendModal;
         setExtendModal((prev) => ({ ...prev, open: false }));
 
-        const data = contractData[contractId];
-        const instanceEntry = data?.entries?.find((e) => e.keyName === 'Contract Instance');
-        const currentRemaining = instanceEntry?.remainingLedgers || 0;
+        const currentRemaining = entry?.remainingLedgers || 0;
         const extendToLedgers = currentRemaining + (days * LEDGERS_PER_DAY);
 
-        showToast(`Extending TTL by ${days} days...`, 'success');
+        // The instance extension also extends the contract's WASM code;
+        // data entries are extended individually.
+        const dataKey = entry && entry.storageType !== 'instance'
+            ? { name: entry.keyName, type: entry.storageType }
+            : null;
+
+        showToast(`Extending ${entry?.keyName || 'TTL'} by ${days} days...`, 'success');
         const result = await extendContractTTL(
             contractId,
             extendToLedgers,
-            walletState.publicKey
+            walletState.publicKey,
+            dataKey
         );
 
         if (result.success) {
@@ -326,16 +345,22 @@ export default function App() {
                             </span>
                         </div>
 
-                        {(() => {
-                            const data = contractData[extendModal.contractId];
-                            const inst = data?.entries?.find((e) => e.keyName === 'Contract Instance');
-                            return inst && !inst.error ? (
-                                <div className="extend-contract-info">
-                                    <span className="extend-label">Current Remaining</span>
-                                    <span className="extend-value">{inst.estimatedTimeLeft} ({inst.remainingLedgers?.toLocaleString()} ledgers)</span>
-                                </div>
-                            ) : null;
-                        })()}
+                        {extendModal.entry && (
+                            <div className="extend-contract-info">
+                                <span className="extend-label">Entry</span>
+                                <span className="extend-value">
+                                    {extendModal.entry.keyName} ({extendModal.entry.storageType})
+                                    {extendModal.entry.storageType === 'instance' && ' + WASM code'}
+                                </span>
+                            </div>
+                        )}
+
+                        {extendModal.entry && !extendModal.entry.error && (
+                            <div className="extend-contract-info">
+                                <span className="extend-label">Current Remaining</span>
+                                <span className="extend-value">{extendModal.entry.estimatedTimeLeft} ({extendModal.entry.remainingLedgers?.toLocaleString()} ledgers)</span>
+                            </div>
+                        )}
 
                         <div className="form-group">
                             <label className="form-label" htmlFor="extend-days-input">Days to Add</label>
@@ -344,13 +369,13 @@ export default function App() {
                                 className="form-input"
                                 type="number"
                                 min="1"
-                                max="365"
+                                max={maxExtendDays}
                                 value={extendModal.days}
-                                onChange={(e) => setExtendModal((p) => ({ ...p, days: Math.max(1, parseInt(e.target.value) || 1) }))}
+                                onChange={(e) => setExtendModal((p) => ({ ...p, days: Math.min(maxExtendDays, Math.max(1, parseInt(e.target.value) || 1)) }))}
                                 autoFocus
                             />
                             <div className="extend-presets">
-                                {[7, 30, 90, 180, 365].map((d) => (
+                                {[7, 30, 90, 180].filter((d) => d <= maxExtendDays).map((d) => (
                                     <button
                                         key={d}
                                         type="button"
@@ -364,6 +389,11 @@ export default function App() {
                             <div className="form-hint">
                                 ≈ {(extendModal.days * LEDGERS_PER_DAY).toLocaleString()} ledgers will be added
                             </div>
+                            {(extendModal.entry?.remainingLedgers || 0) + extendModal.days * LEDGERS_PER_DAY > maxEntryTtl - 1 && (
+                                <div className="form-hint">
+                                    Capped at the network maximum of {(maxEntryTtl - 1).toLocaleString()} ledgers (~{maxExtendDays} days)
+                                </div>
+                            )}
                         </div>
 
                         <div className="form-actions">

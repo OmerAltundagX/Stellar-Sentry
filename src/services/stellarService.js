@@ -8,13 +8,16 @@ import { rpc, xdr, Address, Contract, nativeToScVal } from '@stellar/stellar-sdk
 const RPC_URL = 'https://soroban-testnet.stellar.org:443';
 const NETWORK_PASSPHRASE = 'Test SDF Network ; September 2015';
 
-// Maximum TTL values in ledgers (approximate)
+// Fallback maximum TTL values in ledgers, used until the network's
+// state archival config has been fetched (see getMaxEntryTTL).
 // Ledger closes roughly every ~5 seconds on Testnet
 const MAX_TTL = {
-    persistent: 6_312_000,  // ~1 year (365 days * 24h * 60min * 60s / 5s)
-    temporary: 518_400,     // ~30 days
-    instance: 6_312_000,    // Same as persistent (tied to contract instance)
+    persistent: 3_110_400,  // ~180 days — network maxEntryTtl
+    temporary: 518_400,     // ~30 days (display heuristic)
+    instance: 3_110_400,    // Same as persistent (tied to contract instance)
 };
+
+let networkMaxEntryTtl = null;
 
 // Health thresholds (percentage-based)
 const HEALTH_THRESHOLDS = {
@@ -49,6 +52,30 @@ export async function getLatestLedger() {
 }
 
 /**
+ * Fetch the network's maximum entry TTL (in ledgers) from the state archival
+ * config setting. Cached after the first successful fetch; falls back to
+ * MAX_TTL.persistent if the RPC call fails.
+ * @returns {Promise<number>}
+ */
+export async function getMaxEntryTTL() {
+    if (networkMaxEntryTtl) return networkMaxEntryTtl;
+    try {
+        const server = getServer();
+        const key = xdr.LedgerKey.configSetting(
+            new xdr.LedgerKeyConfigSetting({
+                configSettingId: xdr.ConfigSettingId.configSettingStateArchival(),
+            })
+        );
+        const response = await server.getLedgerEntries(key);
+        const settings = response.entries[0].val.configSetting().stateArchivalSettings();
+        networkMaxEntryTtl = settings.maxEntryTtl();
+        return networkMaxEntryTtl;
+    } catch {
+        return MAX_TTL.persistent;
+    }
+}
+
+/**
  * Checks network connectivity by pinging the Soroban RPC.
  * @returns {Promise<{connected: boolean, latestLedger: number|null, error: string|null}>}
  */
@@ -75,7 +102,7 @@ export async function checkNetworkStatus() {
  * @param {string} contractId — C-encoded Stellar contract address
  * @returns {xdr.LedgerKey}
  */
-function buildInstanceLedgerKey(contractId) {
+export function buildInstanceLedgerKey(contractId) {
     const contractAddress = new Address(contractId);
     return xdr.LedgerKey.contractData(
         new xdr.LedgerKeyContractData({
@@ -93,7 +120,7 @@ function buildInstanceLedgerKey(contractId) {
  * @param {'persistent'|'temporary'} storageType
  * @returns {xdr.LedgerKey}
  */
-function buildDataLedgerKey(contractId, keySymbol, storageType) {
+export function buildDataLedgerKey(contractId, keySymbol, storageType) {
     const contractAddress = new Address(contractId);
     const durability = storageType === 'temporary'
         ? xdr.ContractDataDurability.temporary()
@@ -119,7 +146,9 @@ export function calculateTTL(liveUntilLedgerSeq, currentLedger, storageType = 'p
     const remainingLedgers = Math.max(0, liveUntilLedgerSeq - currentLedger);
     const isExpired = remainingLedgers === 0;
 
-    const maxTTL = MAX_TTL[storageType] || MAX_TTL.persistent;
+    const maxTTL = storageType === 'temporary'
+        ? MAX_TTL.temporary
+        : (networkMaxEntryTtl || MAX_TTL.persistent);
     // Clamp to 100% — entry might have been extended beyond default max
     const healthPercentage = Math.min(100, (remainingLedgers / maxTTL) * 100);
 
@@ -248,6 +277,9 @@ export async function fetchAllContractEntries(config) {
     let error = null;
 
     try {
+        // Make sure health percentages use the real network max TTL
+        await getMaxEntryTTL();
+
         // Always fetch the instance entry first
         const instanceEntry = await fetchContractInstanceTTL(contractId);
         entries.push(instanceEntry);
